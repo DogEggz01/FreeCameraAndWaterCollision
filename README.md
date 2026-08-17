@@ -6,6 +6,7 @@
 - 2 mode for controling camera in Free camera mode.
   - World: Default movement. Every movement is related to world itself, act like game camera.
   - Drone: All movement is based on camera axis, act like mini plane. Optional mouse invert pitch option.
+    - In this mode there will be accerlation/deceleration for camera movement.
 ## Control
 - Press **B** in 3rd person camera mode to enter/leave Free Camera mode.
 - **WASD** to move around, **Space** for raise vertically, **Ctrl** to down vertically
