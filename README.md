@@ -9,7 +9,7 @@
 ## Control
 - Press **B** in 3rd person camera mode to enter/leave Free Camera mode.
 - **WASD** to move around, **Space** for raise vertically, **Ctrl** to down vertically
-- **Q/E** to roll the camera left/right.
+- **Q/E** to roll the camera left/right. Press **R** to roll back to 0 degree.
 - **Mouse Scroll** to zoom in and out
 - Hold **Shift** to increase camera moving speed by 2x
 - Hold **Alt** to decrease camera moving speed to half.
