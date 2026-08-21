@@ -1,4 +1,5 @@
 # FreeCameraAndWaterCollision
+*Disclaimer: This mod is made with ChatGPT 5.6 Sol*
 - Water Collision default on, can be toggle off in configurator.
 - You can adjust the camera collision size in configurator if needed (For example better water clearance in rough waves)
 - Free Camera Mode have 8x vanilla distance(can move furthur away from boat)
