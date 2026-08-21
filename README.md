@@ -15,4 +15,4 @@
 - Hold **Shift** to increase camera moving speed by 2x
 - Hold **Alt** to decrease camera moving speed to half.
 - Shift/alt speed don't affect rolling speed.
-- Press H to detach Camera from boat. Press H again to attach camera to boat.
+- Press **H** to detach Camera from boat. Press **H** again to attach camera to boat.
