@@ -7,7 +7,8 @@ namespace FreeCameraAndCollision
 	[DefaultExecutionOrder(10000)]
 	internal sealed class FreeCameraController : MonoBehaviour
 	{
-		private const KeyCode ToggleKey = KeyCode.B;
+		private const KeyCode DefaultToggleKey = KeyCode.B;
+		private const KeyCode AlternativeToggleKey = KeyCode.P;
 		private const KeyCode FollowShipToggleKey = KeyCode.H;
 		private const KeyCode ControllerToggleKey = KeyCode.JoystickButton8;
 		private const KeyCode ControllerDescendKey = KeyCode.JoystickButton4;
@@ -150,8 +151,11 @@ namespace FreeCameraAndCollision
 				return;
 			}
 
+			KeyCode keyboardToggleKey = plugin.SwapBToP.Value
+				? AlternativeToggleKey
+				: DefaultToggleKey;
 			bool togglePressed =
-				Input.GetKeyDown(ToggleKey) ||
+				Input.GetKeyDown(keyboardToggleKey) ||
 				GameInput.controllerEnabled &&
 				Input.GetKeyDown(ControllerToggleKey);
 

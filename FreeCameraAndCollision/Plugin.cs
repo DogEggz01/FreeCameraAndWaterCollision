@@ -25,7 +25,7 @@ namespace FreeCameraAndCollision
 
 		public const string PluginName = "FreeCamera and Collision";
 
-		public const string PluginVersion = "1.3.1";
+		public const string PluginVersion = "1.3.3";
 
 		private static readonly GUIContent WorldMovementButton =
 			new GUIContent(
@@ -73,6 +73,8 @@ namespace FreeCameraAndCollision
 		internal ConfigEntry<int> CameraRollingSpeed { get; private set; }
 
 		internal ConfigEntry<bool> InvertDroneMousePitch { get; private set; }
+
+		internal ConfigEntry<bool> SwapBToP { get; private set; }
 
 		private void Awake()
 		{
@@ -124,6 +126,18 @@ namespace FreeCameraAndCollision
 
 		private void BindConfiguration()
 		{
+			SwapBToP = Config.Bind(
+				"Free Camera",
+				"Swap B to P",
+				false,
+				new ConfigDescription(
+					"Use P instead of B to enter or leave free camera. Changes apply immediately.",
+					null,
+					new ConfigurationManagerAttributes
+					{
+						Order = 40
+					}));
+
 			MovementMode = Config.Bind(
 				"Free Camera",
 				"Movement Mode",
