@@ -9,7 +9,7 @@
   - Drone: All movement is based on camera axis, act like mini plane. Optional mouse invert pitch option.
     - In this mode there will be accerlation/deceleration for camera movement.
 ## Control
-- Press **B** in 3rd person camera mode to enter/leave Free Camera mode.
+- Press **B** in 3rd person camera mode to enter/leave Free Camera mode. Could be change in configurator to **P**.
 - **WASD** to move around, **Space** for raise vertically, **Ctrl** to down vertically
 - **Q/E** to roll the camera left/right. Press **R** to roll back to 0 degree.
 - **Mouse Scroll** to zoom in and out
