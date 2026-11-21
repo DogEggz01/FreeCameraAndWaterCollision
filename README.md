@@ -9,6 +9,8 @@
   - Drone: All movement is based on camera axis, act like mini plane. Optional mouse invert pitch option.
     - In this mode there will be accerlation/deceleration for camera movement.
 - Photo mode: In pause menu there will be a photo mode button, your game will pause and you will access to multiple option to change how things look.
+<img width="3840" height="2160" alt="208EAB~1" src="https://github.com/user-attachments/assets/97f3f18d-5d2f-45cc-ac27-47faadace82c" />
+
 - Support Player model mod, both the pause menu and free camera for 3rd person camera
 ## Control
 - Press **B** in 3rd person camera mode to enter/leave Free Camera mode. Could be change in configurator to **P**.
