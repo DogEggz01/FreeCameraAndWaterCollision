@@ -24,7 +24,7 @@ namespace FreeCameraAndCollision
     {
         public const string PluginGuid = "com.DogEggz.sailwind.freecameraandcollision";
         public const string PluginName = "FreeCamera and Collision";
-        public const string PluginVersion = "1.4.0";
+        public const string PluginVersion = "1.4.1";
 
         private static readonly GUIContent WorldMovementButton = new GUIContent("World", "Camera movement related to game world.");
         private static readonly GUIContent DroneMovementButton = new GUIContent("Drone", "Camera movement based on camera axis.");

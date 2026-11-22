@@ -22,6 +22,15 @@ namespace FreeCameraAndCollision
         private static readonly MethodInfo EnableSettingsMenuMethod = AccessTools.Method(typeof(StartMenu), "EnableSettingsMenu");
         private static readonly MethodInfo DisableSettingsMenuMethod = AccessTools.Method(typeof(StartMenu), "DisableSettingsMenu");
         private static readonly FieldInfo WeatherLerpField = AccessTools.Field(typeof(Weather), "lerp");
+        private static readonly FieldInfo StormsField = AccessTools.Field(typeof(WeatherStorms), "storms");
+        private static readonly FieldInfo CurrentStormField = AccessTools.Field(typeof(WeatherStorms), "currentStorm");
+        private static readonly FieldInfo BlendedSetField = AccessTools.Field(typeof(WeatherStorms), "blendedSet");
+        private static readonly FieldInfo StormPlayerField = AccessTools.Field(typeof(WeatherStorms), "player");
+        private static readonly FieldInfo BottomParticlesField = AccessTools.Field(typeof(WanderingStorm), "bottomParticles");
+        private static readonly MethodInfo LightningStrikeMethod = AccessTools.Method(typeof(WanderingStormLightning), "LightningStrike");
+        private static readonly FieldInfo LightTimerField = AccessTools.Field(typeof(WanderingStormLightning), "lightTimer");
+        private static readonly FieldInfo CooldownField = AccessTools.Field(typeof(WanderingStormLightning), "lightningCooldown");
+        private static readonly int ExposureId = Shader.PropertyToID("_Exposure");
         private static readonly FieldInfo[] WeatherParticleFields =
         {
             AccessTools.Field(typeof(Weather), "upperClouds"),
@@ -65,7 +74,62 @@ namespace FreeCameraAndCollision
         private float savedNightFogMult;
         private ParticleSystem[] weatherParticles;
         private bool[] savedParticleUnscaled;
+        // Every storm's particle systems and Better Storm's rain, sand and snow, on real time while open, with what each had.
+        private readonly List<ParticleSystem> stormParticles = new List<ParticleSystem>();
+        private readonly List<bool> stormParticlesUnscaled = new List<bool>();
+        private float nextParticleScan;
         private bool weatherFogDirty;
+        private WanderingStorm[] storms;
+        private string[] stormNames;
+
+        // The summoned storm and what it had before; the game's current storm and distance from before the first Summon.
+        private WanderingStorm summoned;
+        private Vector3 summonedLocalPosition;
+        private bool summonedActive;
+        private ParticleSystem summonedCloud;
+        private bool summonedEmitting;
+        private bool summonedFilled;
+        private ParticleSystem[] summonedSystems;
+        private bool[] summonedUnscaled;
+        private WanderingStormLightning lightning;
+        private object savedCooldown;
+        private ParticleSystem[] boltSystems;
+        private float strikeTime;
+        private float boltHoldEnd;
+        private float lastStormFollow;
+        // Better Storm's eye on the summoned storm (its StormEye, null for a storm without one): its clearness field, the clear
+        // band's outer and inner edge, the clearness shown now and when taken.
+        private Component summonedEye;
+        private FieldInfo eyeClearnessField;
+        private float eyeClearOuter;
+        private float eyeClearInner;
+        private float eyeClearness;
+        private float savedEyeClearness;
+
+        // The flash of a shown strike: its light's intensity (the strike's own until moved) and a factor on the sky's brightness
+        // (the ambient colours, the fog colour, the sky's exposure); the values before the factor and as written, so it never
+        // compounds.
+        private Setting flashLight;
+        private float flashSky = 1f;
+        private Light strikeLight;
+        private bool skyScaled;
+        private readonly Color[] skyBase = new Color[4];
+        private readonly Color[] skyWritten = new Color[4];
+        private Material scaledSky;
+        private float exposureBase;
+        private float exposureWritten;
+        private bool gameStormSaved;
+        private WanderingStorm savedCurrentStorm;
+        private float savedStormDistance;
+        private Vector3 summonOrigin;
+        private Vector3 summonForward;
+
+        // The blend set's own sky copies, swapped in while its sky is the region's clear sky (a blend would write into that).
+        private WeatherSet skySet;
+        private Material savedDaySky;
+        private Material savedDawnSky;
+        private Material ownDaySky;
+        private Material ownDawnSky;
 
         private PostProcessingBehaviour postProcessing;
         private PostProcessingProfile originalProfile;
@@ -290,6 +354,16 @@ namespace FreeCameraAndCollision
                 }
             }
 
+            CollectStorms();
+            for (int i = 0; storms != null && i < storms.Length; i++)
+            {
+                if (storms[i] != null)
+                {
+                    TakeStormParticles(storms[i].GetComponentsInChildren<ParticleSystem>(true));
+                }
+            }
+
+            ScanBetterStormParticles(true);
             postProcessing = mainCamera.GetComponent<PostProcessingBehaviour>();
             originalProfile = postProcessing != null ? postProcessing.profile : null;
             if (originalProfile != null)
@@ -351,7 +425,19 @@ namespace FreeCameraAndCollision
                 sunLight.intensity = savedSunIntensity;
             }
 
+            PutStormBack();
             RestoreWeather();
+            for (int i = 0; i < stormParticles.Count; i++)
+            {
+                if (stormParticles[i] != null)
+                {
+                    ParticleSystem.MainModule main = stormParticles[i].main;
+                    main.useUnscaledTime = stormParticlesUnscaled[i];
+                }
+            }
+
+            stormParticles.Clear();
+            stormParticlesUnscaled.Clear();
             for (int i = 0; i < weatherParticles.Length; i++)
             {
                 if (weatherParticles[i] != null)
@@ -425,6 +511,61 @@ namespace FreeCameraAndCollision
             {
                 UpdatePanel();
             }
+
+            if (summoned != null)
+            {
+                FollowSummonedStorm();
+            }
+
+            if (Time.unscaledTime >= nextParticleScan)
+            {
+                ScanBetterStormParticles(false);
+            }
+        }
+
+        private void TakeStormParticles(ParticleSystem[] systems)
+        {
+            for (int i = 0; i < systems.Length; i++)
+            {
+                TakeStormParticle(systems[i], systems[i] != null && systems[i].main.useUnscaledTime);
+            }
+        }
+
+        private void TakeStormParticle(ParticleSystem system, bool had)
+        {
+            if (system == null || stormParticles.Contains(system))
+            {
+                return;
+            }
+
+            ParticleSystem.MainModule main = system.main;
+            stormParticles.Add(system);
+            stormParticlesUnscaled.Add(had);
+            main.useUnscaledTime = true;
+        }
+
+        // Better Storm makes its rain and snow under the shifting world and its sand beside the game's outer rain when first needed,
+        // as copies of the game's rain, so one made while open carries the real time photo mode gave that rain; it is given back the
+        // rain's own setting. Looked for once a second.
+        private void ScanBetterStormParticles(bool atOpen)
+        {
+            nextParticleScan = Time.unscaledTime + 1f;
+            bool rainHad = savedParticleUnscaled.Length > 3 && savedParticleUnscaled[3];
+            Transform world = Refs.shiftingWorld;
+            ParticleSystem outerRain = weatherParticles.Length > 3 ? weatherParticles[3] : null;
+            Transform rainParent = outerRain != null ? outerRain.transform.parent : null;
+            TakeBetterStormParticle(world != null ? world.Find("Better Storm Rain") : null, atOpen, rainHad);
+            TakeBetterStormParticle(world != null ? world.Find("Better Storm Gentle Snow Particles") : null, atOpen, rainHad);
+            TakeBetterStormParticle(rainParent != null ? rainParent.Find("Better Storm Sand Particles") : null, atOpen, rainHad);
+        }
+
+        private void TakeBetterStormParticle(Transform found, bool atOpen, bool rainHad)
+        {
+            ParticleSystem system = found != null ? found.GetComponent<ParticleSystem>() : null;
+            if (system != null)
+            {
+                TakeStormParticle(system, atOpen ? system.main.useUnscaledTime : rainHad);
+            }
         }
 
         // After the game's per-frame writers: the time's sunlight, the weather's fog set, the picture, the fog and the body.
@@ -447,6 +588,20 @@ namespace FreeCameraAndCollision
             {
                 weatherFogDirty = false;
                 ApplyWeatherFog();
+            }
+
+            if (boltHoldEnd > 0f)
+            {
+                HoldBolts();
+            }
+
+            if (strikeLight != null)
+            {
+                ApplyFlash();
+            }
+            else if (skyScaled)
+            {
+                RestoreSky();
             }
 
             ApplyPicture();
@@ -484,7 +639,11 @@ namespace FreeCameraAndCollision
         private void SetWeatherPreset(int preset)
         {
             weatherPreset = preset;
-            if (preset == 0)
+            if (preset == 0 && summoned != null)
+            {
+                ApplySummonedWeather();
+            }
+            else if (preset == 0)
             {
                 RestoreWeather();
             }
@@ -534,6 +693,10 @@ namespace FreeCameraAndCollision
             {
                 fog.ApplySet(PresetFog(weatherPreset));
             }
+            else if (summoned != null)
+            {
+                ApplySummonedWeather();
+            }
             else if (time.Set && WeatherStorms.instance != null)
             {
                 // Weather.ChangeWeather is blocked while open, so this only recomputes the fog values for the new time.
@@ -543,6 +706,548 @@ namespace FreeCameraAndCollision
             {
                 RestoreFogValues(fog);
             }
+        }
+
+        // The game's storm list (Better Storm adds its storms to it), named for the panel; the current storm selected.
+        private void CollectStorms()
+        {
+            WeatherStorms weatherStorms = WeatherStorms.instance;
+            storms = weatherStorms != null ? StormsField?.GetValue(weatherStorms) as WanderingStorm[] : null;
+            int count = storms != null ? storms.Length : 0;
+            stormNames = new string[count];
+            stormIndex = 0;
+            WanderingStorm current = weatherStorms != null ? weatherStorms.GetCurrentStorm() : null;
+            int gameStorms = 0;
+            for (int i = 0; i < count; i++)
+            {
+                string name = storms[i] != null ? storms[i].name : string.Empty;
+                stormNames[i] = name.StartsWith("Better Storm ") ? name.Substring("Better Storm ".Length) : "Game storm " + ++gameStorms;
+                if (storms[i] == current)
+                {
+                    stormIndex = i;
+                }
+            }
+        }
+
+        // Summon: the chosen storm placed by the distance and direction from the camera's place and view now, and the weather
+        // worked out from it. A lit weather preset goes off, so the weather follows the storm.
+        private void SummonStorm()
+        {
+            WeatherStorms weatherStorms = WeatherStorms.instance;
+            WanderingStorm storm = stormIndex < storms.Length ? storms[stormIndex] : null;
+            Transform view = StormDistanceOrigin(weatherStorms);
+            if (weatherStorms == null || storm == null || view == null)
+            {
+                return;
+            }
+
+            if (!gameStormSaved)
+            {
+                savedCurrentStorm = weatherStorms.GetCurrentStorm();
+                savedStormDistance = WeatherStorms.currentStormDistance;
+                gameStormSaved = true;
+            }
+
+            summonOrigin = view.position;
+            Vector3 forward = view.forward;
+            forward.y = 0f;
+            summonForward = forward.sqrMagnitude > 1e-6f ? forward.normalized : Vector3.forward;
+            if (summoned != storm)
+            {
+                ReleaseStorm();
+                TakeStorm(storm);
+            }
+
+            stormSummoned = true;
+            weatherPreset = 0;
+            MoveStorm();
+        }
+
+        // The storm the panel names taken instead of the summoned one, at the same distance and direction.
+        private void ChangeSummonedStorm()
+        {
+            WanderingStorm storm = storms[stormIndex];
+            if (summoned == null || storm == null || storm == summoned)
+            {
+                return;
+            }
+
+            ReleaseStorm();
+            TakeStorm(storm);
+            MoveStorm();
+        }
+
+        // What the storm had is kept; its particle systems run on real time and its cloud emits while summoned.
+        private void TakeStorm(WanderingStorm storm)
+        {
+            summoned = storm;
+            summonedLocalPosition = storm.transform.localPosition;
+            summonedActive = storm.active;
+            summonedSystems = storm.GetComponentsInChildren<ParticleSystem>(true);
+            summonedUnscaled = new bool[summonedSystems.Length];
+            for (int i = 0; i < summonedSystems.Length; i++)
+            {
+                ParticleSystem.MainModule main = summonedSystems[i].main;
+                summonedUnscaled[i] = main.useUnscaledTime;
+                main.useUnscaledTime = true;
+            }
+
+            summonedCloud = BottomParticlesField?.GetValue(storm) as ParticleSystem;
+            summonedEmitting = summonedCloud != null && summonedCloud.emission.enabled;
+            if (summonedCloud != null)
+            {
+                ParticleSystem.EmissionModule emission = summonedCloud.emission;
+                emission.enabled = true;
+            }
+
+            summonedFilled = false;
+            TakeEye(storm);
+            lastStormFollow = Time.unscaledTime;
+            lightning = StrikingLightning(storm);
+            boltSystems = lightning != null ? lightning.GetComponentsInChildren<ParticleSystem>(true) : new ParticleSystem[0];
+            boltHoldEnd = 0f;
+
+            // A storm made active with its strike already due would strike at once and, game time standing still, keep that
+            // flash lit with no bolt: its next strike is put off while summoned.
+            savedCooldown = lightning != null ? CooldownField?.GetValue(lightning) : null;
+            if (savedCooldown != null)
+            {
+                CooldownField.SetValue(lightning, float.MaxValue);
+            }
+        }
+
+        // A storm has two lightning objects. The game strikes from "lightning (good)", switched on: a fade curve of three
+        // flickers, a per-pixel light, its bolt. "lightning" is switched off and unused: no curve keys, a vertex light, a 600 m
+        // bolt billboard. A storm with no switched-on lightning (Better Storm turns it off in storms without lightning) has none.
+        private static WanderingStormLightning StrikingLightning(WanderingStorm storm)
+        {
+            WanderingStormLightning[] all = storm.GetComponentsInChildren<WanderingStormLightning>(true);
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].enabled && all[i].gameObject.activeInHierarchy)
+                {
+                    return all[i];
+                }
+            }
+
+            return null;
+        }
+
+        // The lightning objects' particle systems (the game names them "lightning", "lightning (good)").
+        private static bool IsBolt(ParticleSystem system)
+        {
+            return system.name.StartsWith("lightning");
+        }
+
+        private void MoveStorm()
+        {
+            Vector3 position = summonOrigin + Quaternion.Euler(0f, stormDirection, 0f) * summonForward * (stormDistance * 1000f);
+            position.y = summoned.transform.position.y;
+            summoned.transform.position = position;
+            summoned.active = true;
+            ApplySummonedWeather();
+
+            // An empty cloud (the storm was beyond its cloud distance) is filled at once: on real time it fills over a minute.
+            if (summonedCloud != null && summonedCloud.particleCount == 0)
+            {
+                for (int i = 0; i < summonedSystems.Length; i++)
+                {
+                    ParticleSystem system = summonedSystems[i];
+                    if (system != null && !IsBolt(system) && system.particleCount == 0 && system.emission.enabled)
+                    {
+                        system.Simulate(60f, false, true);
+                        system.Play(false);
+                    }
+                }
+
+                summonedFilled = true;
+            }
+        }
+
+        // The summoned storm made the game's current storm at the camera's distance, and the game's own blend of the region's
+        // weather for that distance shown at once (Weather.ChangeWeather is blocked while open).
+        private void ApplySummonedWeather()
+        {
+            WeatherStorms weatherStorms = WeatherStorms.instance;
+            Transform view = StormDistanceOrigin(weatherStorms);
+            if (weatherStorms == null || view == null)
+            {
+                return;
+            }
+
+            OwnBlendSky(weatherStorms);
+            CurrentStormField.SetValue(weatherStorms, summoned);
+            WeatherStorms.currentStormDistance = Vector3.Distance(view.position, summoned.transform.position);
+            weatherStorms.ApplyStorm();
+            if (weatherPreset == 0)
+            {
+                weather.targetWeatherSet = BlendedSetField.GetValue(weatherStorms) as WeatherSet;
+                WeatherLerpField.SetValue(weather, 1f);
+            }
+            else
+            {
+                // ApplyStorm applied the storm's fog set; the lit preset's comes back in LateUpdate.
+                weatherFogDirty = true;
+            }
+        }
+
+        // Better Storm's eye clears by its clearness, which Better Storm eases with game time (still while paused); photo mode
+        // eases it while the storm is summoned.
+        private void TakeEye(WanderingStorm storm)
+        {
+            summonedEye = storm.GetComponent("StormEye");
+            Type eyeType = summonedEye != null ? summonedEye.GetType() : null;
+            eyeClearnessField = eyeType != null ? AccessTools.Field(eyeType, "shownClearness") : null;
+            object shape = eyeType != null ? AccessTools.Property(eyeType, "Shape")?.GetValue(summonedEye, null) : null;
+            Type shapeType = shape?.GetType();
+            if (eyeClearnessField == null || shapeType == null
+                || !(AccessTools.Field(shapeType, "HasEye")?.GetValue(shape) is bool hasEye) || !hasEye
+                || !(AccessTools.Field(shapeType, "ClearOuter")?.GetValue(shape) is float outer)
+                || !(AccessTools.Field(shapeType, "ClearInner")?.GetValue(shape) is float inner)
+                || !(eyeClearnessField.GetValue(summonedEye) is float shown))
+            {
+                summonedEye = null;
+                return;
+            }
+
+            eyeClearOuter = outer;
+            eyeClearInner = inner;
+            savedEyeClearness = shown;
+            eyeClearness = Mathf.Max(0f, shown);
+        }
+
+        // The game's weather tick and Better Storm's eye both run on game time, which stands still while paused: every
+        // StormFollowInterval of real time the summoned storm's weather is worked out again for where the camera is now, and
+        // the eye eases toward the clearness of the camera's place as Better Storm does in play.
+        private void FollowSummonedStorm()
+        {
+            float step = Time.unscaledTime - lastStormFollow;
+            if (step < StormFollowInterval)
+            {
+                return;
+            }
+
+            lastStormFollow = Time.unscaledTime;
+            Transform view = StormDistanceOrigin(WeatherStorms.instance);
+            if (view == null)
+            {
+                return;
+            }
+
+            Vector3 offset = summoned.transform.position - view.position;
+            bool changed = Mathf.Abs(offset.magnitude - WeatherStorms.currentStormDistance) > 1f;
+            if (summonedEye != null)
+            {
+                offset.y = 0f;
+                float target = Mathf.InverseLerp(eyeClearOuter, eyeClearInner, offset.magnitude);
+                float shown = Mathf.MoveTowards(eyeClearness, target, Mathf.Min(step, Time.maximumDeltaTime) / EyeOpenSeconds);
+                if (shown != eyeClearness)
+                {
+                    eyeClearness = shown;
+                    eyeClearnessField.SetValue(summonedEye, shown);
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                ApplySummonedWeather();
+            }
+        }
+
+        // The point the game measures the storm distance from (the main camera).
+        private Transform StormDistanceOrigin(WeatherStorms weatherStorms)
+        {
+            Transform origin = weatherStorms != null ? StormPlayerField?.GetValue(weatherStorms) as Transform : null;
+            return origin != null ? origin : controller.CenterEye;
+        }
+
+        // In clear weather the game points the blend set's skies at the region's clear ones, and the next blend is written into
+        // them; before each blend they are swapped for copies holding the same values.
+        private void OwnBlendSky(WeatherStorms weatherStorms)
+        {
+            WeatherSet blended = BlendedSetField.GetValue(weatherStorms) as WeatherSet;
+            WeatherSet clear = weather.currentRegion != null ? weather.currentRegion.clearWeather : null;
+            if (blended == null || clear == null || blended.dayPalette.skyMaterial != clear.dayPalette.skyMaterial)
+            {
+                return;
+            }
+
+            if (ownDaySky == null)
+            {
+                skySet = blended;
+                savedDaySky = blended.dayPalette.skyMaterial;
+                savedDawnSky = blended.dawnPalette.skyMaterial;
+                ownDaySky = new Material(savedDaySky);
+                ownDawnSky = new Material(savedDawnSky);
+            }
+            else
+            {
+                ownDaySky.CopyPropertiesFromMaterial(blended.dayPalette.skyMaterial);
+                ownDawnSky.CopyPropertiesFromMaterial(blended.dawnPalette.skyMaterial);
+            }
+
+            blended.dayPalette.skyMaterial = ownDaySky;
+            blended.dawnPalette.skyMaterial = ownDawnSky;
+        }
+
+        // One strike from the summoned storm. The strike turns its light on only when it shows (within the light's range + 500 m
+        // of the player); then its bolt and light run on real time to HoldAge and are held there.
+        private void Strike()
+        {
+            if (summoned == null || lightning == null || LightningStrikeMethod == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < boltSystems.Length; i++)
+            {
+                boltSystems[i].Clear(false);
+            }
+
+            Light flash = lightning.GetComponent<Light>();
+            if (flash != null)
+            {
+                flash.enabled = false;
+            }
+
+            strikeLight = null;
+            LightningStrikeMethod.Invoke(lightning, null);
+            if (flash == null || !flash.enabled)
+            {
+                return;
+            }
+
+            strikeLight = flash;
+            for (int i = 0; i < boltSystems.Length; i++)
+            {
+                boltSystems[i].Play(false);
+            }
+
+            strikeTime = Time.unscaledTime;
+            boltHoldEnd = strikeTime + HoldAge;
+        }
+
+        // The strike's age on real time given to its light timer, from which the game's Update sets the light by its curve (game
+        // time stands still, so the timer stays where it is put); at HoldAge the bolt systems are paused.
+        private void HoldBolts()
+        {
+            if (lightning != null)
+            {
+                LightTimerField?.SetValue(lightning, Mathf.Min(Time.unscaledTime - strikeTime, HoldAge));
+            }
+
+            if (Time.unscaledTime < boltHoldEnd)
+            {
+                return;
+            }
+
+            for (int i = 0; i < boltSystems.Length; i++)
+            {
+                if (boltSystems[i] != null && !boltSystems[i].isPaused)
+                {
+                    boltSystems[i].Pause(false);
+                }
+            }
+
+            boltHoldEnd = 0f;
+        }
+
+        // After the game's writers of the frame: its Update sets the strike's light from its curve, and Weather.Update writes the
+        // ambient colours, the fog colour and the sky's values each frame.
+        private void ApplyFlash()
+        {
+            if (flashLight.Set)
+            {
+                strikeLight.intensity = flashLight.Value;
+            }
+
+            if (flashSky != 1f)
+            {
+                ScaleSky();
+            }
+            else if (skyScaled)
+            {
+                RestoreSky();
+            }
+        }
+
+        private void ScaleSky()
+        {
+            RenderSettings.ambientLight = ScaledColour(0, RenderSettings.ambientLight);
+            RenderSettings.ambientEquatorColor = ScaledColour(1, RenderSettings.ambientEquatorColor);
+            RenderSettings.ambientGroundColor = ScaledColour(2, RenderSettings.ambientGroundColor);
+            RenderSettings.fogColor = ScaledColour(3, RenderSettings.fogColor);
+            Material sky = RenderSettings.skybox;
+            if (sky != null && sky.HasProperty(ExposureId))
+            {
+                float exposure = sky.GetFloat(ExposureId);
+                if (!skyScaled || sky != scaledSky || exposure != exposureWritten)
+                {
+                    exposureBase = exposure;
+                }
+
+                scaledSky = sky;
+                exposureWritten = exposureBase * flashSky;
+                sky.SetFloat(ExposureId, exposureWritten);
+            }
+
+            skyScaled = true;
+        }
+
+        // A value rewritten since the last frame is the new base; one still as written keeps its base.
+        private Color ScaledColour(int index, Color current)
+        {
+            if (!skyScaled || current != skyWritten[index])
+            {
+                skyBase[index] = current;
+            }
+
+            skyWritten[index] = skyBase[index] * flashSky;
+            return skyWritten[index];
+        }
+
+        // The values put back where nothing has rewritten them since.
+        private void RestoreSky()
+        {
+            skyScaled = false;
+            if (RenderSettings.ambientLight == skyWritten[0])
+            {
+                RenderSettings.ambientLight = skyBase[0];
+            }
+
+            if (RenderSettings.ambientEquatorColor == skyWritten[1])
+            {
+                RenderSettings.ambientEquatorColor = skyBase[1];
+            }
+
+            if (RenderSettings.ambientGroundColor == skyWritten[2])
+            {
+                RenderSettings.ambientGroundColor = skyBase[2];
+            }
+
+            if (RenderSettings.fogColor == skyWritten[3])
+            {
+                RenderSettings.fogColor = skyBase[3];
+            }
+
+            if (scaledSky != null && scaledSky.GetFloat(ExposureId) == exposureWritten)
+            {
+                scaledSky.SetFloat(ExposureId, exposureBase);
+            }
+
+            scaledSky = null;
+        }
+
+        // The summoned storm given back what it had: its place, its state, its particles' clock and emission, its lightning.
+        private void ReleaseStorm()
+        {
+            if (summoned == null)
+            {
+                return;
+            }
+
+            summoned.transform.localPosition = summonedLocalPosition;
+            summoned.active = summonedActive;
+            for (int i = 0; i < summonedSystems.Length; i++)
+            {
+                ParticleSystem system = summonedSystems[i];
+                if (system == null)
+                {
+                    continue;
+                }
+
+                ParticleSystem.MainModule main = system.main;
+                main.useUnscaledTime = summonedUnscaled[i];
+                if (IsBolt(system))
+                {
+                    // stopped rather than played on, so a held bolt doesn't emit again once the game runs
+                    system.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear);
+                }
+                else if (summonedFilled)
+                {
+                    system.Clear(false);
+                }
+            }
+
+            if (summonedCloud != null)
+            {
+                ParticleSystem.EmissionModule emission = summonedCloud.emission;
+                emission.enabled = summonedEmitting;
+            }
+
+            if (lightning != null)
+            {
+                Light flash = lightning.GetComponent<Light>();
+                if (flash != null)
+                {
+                    flash.enabled = false;
+                }
+
+                if (savedCooldown != null)
+                {
+                    CooldownField.SetValue(lightning, savedCooldown);
+                }
+            }
+
+            if (summonedEye != null)
+            {
+                eyeClearnessField.SetValue(summonedEye, savedEyeClearness);
+                summonedEye = null;
+            }
+
+            summoned = null;
+            lightning = null;
+            boltHoldEnd = 0f;
+            strikeLight = null;
+            if (skyScaled)
+            {
+                RestoreSky();
+            }
+        }
+
+        // Summon pressed again, Reset All and leaving: the storm, the game's current storm and distance and the blend set's skies
+        // put back, the game's blend worked out again for them, then the weather as photo mode found it.
+        private void PutStormBack()
+        {
+            stormSummoned = false;
+            ReleaseStorm();
+            WeatherStorms weatherStorms = WeatherStorms.instance;
+            if (gameStormSaved && weatherStorms != null)
+            {
+                if (skySet != null)
+                {
+                    if (skySet.dayPalette.skyMaterial == ownDaySky)
+                    {
+                        skySet.dayPalette.skyMaterial = savedDaySky;
+                    }
+
+                    if (skySet.dawnPalette.skyMaterial == ownDawnSky)
+                    {
+                        skySet.dawnPalette.skyMaterial = savedDawnSky;
+                    }
+                }
+
+                CurrentStormField.SetValue(weatherStorms, savedCurrentStorm);
+                WeatherStorms.currentStormDistance = savedStormDistance;
+                weatherStorms.ApplyStorm();
+            }
+
+            if (ownDaySky != null)
+            {
+                Destroy(ownDaySky);
+                Destroy(ownDawnSky);
+            }
+
+            skySet = null;
+            ownDaySky = ownDawnSky = savedDaySky = savedDawnSky = null;
+            gameStormSaved = false;
+            if (weatherPreset == 0)
+            {
+                RestoreWeather();
+            }
+
+            weatherFogDirty = true;
         }
 
         private void RestoreWeather()
@@ -757,8 +1462,9 @@ namespace FreeCameraAndCollision
         // Where the Photo Mode button sits in the game's pause menu, local to its settings page: under the version box.
         private static readonly Vector3 GameMenuButtonPosition = new Vector3(2.30f, -1.03f, -0.13f);
 
-        // The layout, in the settings page's units; y runs down from the panel's top edge.
-        private const float PanelWidth = 2.84f;
+        // The layout, in the settings page's units; y runs down from the panel's top edge. A slider row: label, arrow, bar
+        // strip, arrow, value, reset; a tick box sits where the row's first arrow does.
+        private const float PanelWidth = 3.04f;
         private const float Padding = 0.14f;
         private const float RowHeight = 0.16f;
         private const float HeadingHeight = 0.2f;
@@ -769,10 +1475,14 @@ namespace FreeCameraAndCollision
         private const float BoxWidth = 0.15f;
         private const float BoxHeight = 0.13f;
         private const float LabelRight = 1.30f;
-        private const float StripLeft = 1.38f;
-        private const float StripWidth = 0.74f;
-        private const float ValueRight = 2.50f;
-        private const float ResetCentre = 2.625f;
+        private const float StepLeft = 1.38f;
+        private const float StepWidth = 0.13f;
+        private const float StepGap = 0.035f;
+        private const float StripLeft = StepLeft + StepWidth + StepGap;
+        private const float StripWidth = 0.60f;
+        private const float MoreCentre = StripLeft + StripWidth + StepGap + StepWidth * 0.5f;
+        private const float ValueRight = 2.69f;
+        private const float ResetCentre = 2.815f;
         private const float HintHeight = 0.26f;
         private const float PaperMargin = 0.08f;
         private const float PaperDepth = 0.16f;
@@ -787,6 +1497,20 @@ namespace FreeCameraAndCollision
         private const float ScreenMargin = 0.04f;
         private static readonly Color PaperEmission = new Color(0.85f, 0.85f, 0.85f, 1f);
         private const float DimAlpha = 0.35f;
+        // An arrow held down steps again after the delay, then at the interval (real seconds).
+        private const float StepRepeatDelay = 0.4f;
+        private const float StepRepeatInterval = 0.06f;
+        private const float MaximumStormDistance = 20f;
+        private const float DefaultStormDistance = 8f;
+        private const float MaximumFlashLight = 20f;
+        private const float MaximumFlashSky = 4f;
+        // The strike's age at which its bolt and light are held: the game's fade curve's third flicker at its peak (0.94 of the
+        // strike's intensity), the bolt fully drawn.
+        private const float HoldAge = 0.69f;
+        // The game's interval between storm weather updates (WeatherStorms.Update).
+        private const float StormFollowInterval = 0.05f;
+        // Better Storm's eye goes fully clear or back in this long (StormEye.EyeOpenSeconds).
+        private const float EyeOpenSeconds = 1.5f;
 
         // A panel value that follows the game's until it is moved; Reset makes it follow again.
         private struct Setting
@@ -798,10 +1522,15 @@ namespace FreeCameraAndCollision
         private enum SliderId
         {
             Time, FieldOfView, FocusDistance, Aperture, Exposure, Contrast, Saturation, Temperature, Tint, BloomIntensity,
-            BloomThreshold, Vignette, VignetteSoftness, FilmGrain, GrainSize, ChromaticAberration, Fog, VolumetricFog
+            BloomThreshold, Vignette, VignetteSoftness, FilmGrain, GrainSize, ChromaticAberration, Fog, VolumetricFog,
+            StormDistance, StormDirection, FlashLight, FlashSky
         }
 
-        private enum Part { HideUi, Leave, Weather, DepthOfField, HideBody, Grid, ResetAll, Slider, Reset }
+        private enum Part
+        {
+            HideUi, Leave, Weather, DepthOfField, HideBody, Grid, ResetAll, Slider, Reset, Less, More, StormPrevious, StormNext,
+            Summon, Lightning
+        }
 
         // A pressable area, in panel units, and the outline of its plate, shown while the pointer is on it.
         private struct Hit
@@ -820,6 +1549,10 @@ namespace FreeCameraAndCollision
             public TextMesh Value;
             public Renderer ResetPlate;
             public TextMesh ResetArrow;
+            public Renderer LessPlate;
+            public TextMesh LessText;
+            public Renderer MorePlate;
+            public TextMesh MoreText;
             public float BarsLeft;
             public float BarsWidth;
             public float ShownValue;
@@ -867,6 +1600,10 @@ namespace FreeCameraAndCollision
         private float aperture;
         private bool showGrid;
         private bool mouseOverPanel;
+        private bool stormSummoned;
+        private int stormIndex;
+        private float stormDistance;
+        private float stormDirection;
 
         private Transform panelRoot;
         private float panelHeight;
@@ -879,6 +1616,12 @@ namespace FreeCameraAndCollision
         private TextMesh gridMark;
         private TextMesh hideBodyLabel;
         private Renderer hideBodyPlate;
+        private TextMesh stormNameText;
+        private Renderer stormPreviousPlate;
+        private Renderer stormNextPlate;
+        private Renderer summonPlate;
+        private Renderer lightningPlate;
+        private TextMesh lightningText;
         private Material plateOn;
         private Material plateOff;
         private Color ink;
@@ -887,8 +1630,11 @@ namespace FreeCameraAndCollision
         private readonly string[] barTexts = new string[BarCount + 1];
         private int hovered = -1;
         private SliderRow dragged;
+        private int steppedHit = -1;
+        private float nextStepTime;
         private int shownPreset;
         private int shownChecks;
+        private int shownStorm;
         private int layoutWidth;
         private int layoutHeight;
 
@@ -910,10 +1656,20 @@ namespace FreeCameraAndCollision
             focusDistance = 10f;
             aperture = 5.6f;
             showGrid = false;
+            stormSummoned = false;
+            stormDistance = DefaultStormDistance;
+            stormDirection = 0f;
+            flashLight = default(Setting);
+            flashSky = 1f;
         }
 
         private void ResetAll()
         {
+            if (summoned != null)
+            {
+                PutStormBack();
+            }
+
             if (time.Set)
             {
                 ResetTime();
@@ -1000,7 +1756,7 @@ namespace FreeCameraAndCollision
             y -= ButtonRowHeight * 0.5f;
 
             List<SliderRow> rows = new List<SliderRow>();
-            AddHeading(parts, "SCENE", ref y);
+            AddHeading(parts, "WEATHER", ref y);
             rows.Add(AddSlider(parts, SliderId.Time, "time of day", rows.Count, ref y));
             y -= ButtonRowHeight * 0.5f;
             int weatherCount = WeatherNames.Length;
@@ -1012,6 +1768,7 @@ namespace FreeCameraAndCollision
             }
 
             y -= ButtonRowHeight * 0.5f;
+            AddStormRows(parts, buttonWidth, rows, ref y);
             AddHeading(parts, "CAMERA", ref y);
             rows.Add(AddSlider(parts, SliderId.FieldOfView, "field of view", rows.Count, ref y));
             depthOfFieldMark = AddCheckbox(parts, Part.DepthOfField, "depth of field", ref y, out _, out _);
@@ -1146,7 +1903,7 @@ namespace FreeCameraAndCollision
         {
             y -= RowHeight * 0.5f;
             labelText = AddText(parts, parts.Label, "label " + label, label, LabelRight, y, TextAnchor.MiddleRight);
-            float x = StripLeft + BoxWidth * 0.5f;
+            float x = StepLeft + BoxWidth * 0.5f;
             box = AddPlate(parts, parts.Plate, "checkbox " + label, x, y, BoxWidth, BoxHeight);
             box.sharedMaterial = plateOn;
             TextMesh mark = AddText(parts, parts.Mark, "mark " + label, string.Empty, x, y + parts.MarkOffset, TextAnchor.MiddleCenter);
@@ -1170,7 +1927,9 @@ namespace FreeCameraAndCollision
             row.Bars.transform.localScale = new Vector3(barsScale.x * squeeze, barsScale.y, barsScale.z);
             row.Value = AddText(parts, parts.Value, "value " + label, string.Empty, ValueRight, y, TextAnchor.MiddleRight);
             AddHit(Part.Slider, index, stripX, y, StripWidth, RowHeight, strip);
-            if (id != SliderId.FocusDistance && id != SliderId.Aperture)
+            row.LessPlate = AddStep(parts, Part.Less, index, "<", "less " + label, StepLeft + StepWidth * 0.5f, y, out row.LessText);
+            row.MorePlate = AddStep(parts, Part.More, index, ">", "more " + label, MoreCentre, y, out row.MoreText);
+            if (HasReset(id))
             {
                 row.ResetPlate = AddPlate(parts, parts.Plate, "reset " + label, ResetCentre, y, BoxWidth, BoxHeight);
                 row.ResetArrow = AddText(parts, parts.Arrow, "arrow " + label, "↩", ResetCentre, y, TextAnchor.MiddleCenter, 0.8f);
@@ -1179,6 +1938,35 @@ namespace FreeCameraAndCollision
 
             y -= RowHeight * 0.5f;
             return row;
+        }
+
+        // A small plate with an arrow on it.
+        private Renderer AddStep(PanelParts parts, Part part, int index, string arrow, string name, float x, float y, out TextMesh text)
+        {
+            Renderer plate = AddPlate(parts, parts.Plate, name, x, y, StepWidth, BoxHeight);
+            plate.sharedMaterial = plateOn;
+            text = AddText(parts, parts.PlateText, "text " + name, arrow, x, y, TextAnchor.MiddleCenter);
+            AddHit(part, index, x, y, StepWidth, BoxHeight, plate);
+            return plate;
+        }
+
+        // The storm's rows: the storm chosen with arrows on either side, Enable Storm and Summon Lightning, its distance and
+        // direction, the strike's flash.
+        private void AddStormRows(PanelParts parts, float buttonWidth, List<SliderRow> rows, ref float y)
+        {
+            y -= RowHeight * 0.5f;
+            stormPreviousPlate = AddStep(parts, Part.StormPrevious, 0, "<", "storm previous", Padding + StepWidth * 0.5f, y, out _);
+            stormNameText = AddText(parts, parts.Label, "storm name", string.Empty, PanelWidth * 0.5f, y, TextAnchor.MiddleCenter);
+            stormNextPlate = AddStep(parts, Part.StormNext, 0, ">", "storm next", PanelWidth - Padding - StepWidth * 0.5f, y, out _);
+            y -= RowHeight * 0.5f + ButtonRowHeight * 0.5f;
+            summonPlate = AddButton(parts, Part.Summon, "Enable Storm", Padding + buttonWidth * 0.5f, y, buttonWidth);
+            lightningPlate = AddButton(parts, Part.Lightning, "Summon Lightning", PanelWidth - Padding - buttonWidth * 0.5f, y, buttonWidth);
+            lightningText = panelRoot.Find("text Summon Lightning").GetComponent<TextMesh>();
+            y -= ButtonRowHeight * 0.5f;
+            rows.Add(AddSlider(parts, SliderId.StormDistance, "storm distance", rows.Count, ref y));
+            rows.Add(AddSlider(parts, SliderId.StormDirection, "storm direction", rows.Count, ref y));
+            rows.Add(AddSlider(parts, SliderId.FlashLight, "flash light", rows.Count, ref y));
+            rows.Add(AddSlider(parts, SliderId.FlashSky, "flash sky brightness", rows.Count, ref y));
         }
 
         // The page's paper stretched behind the panel, its texture drawn as emission so the light of the time of day photo mode
@@ -1217,6 +2005,7 @@ namespace FreeCameraAndCollision
 
             shownPreset = -1;
             shownChecks = -1;
+            shownStorm = -1;
             RefreshPanel();
         }
 
@@ -1224,6 +2013,7 @@ namespace FreeCameraAndCollision
         {
             SetHovered(-1);
             dragged = null;
+            steppedHit = -1;
             mouseOverPanel = false;
             if (panelRoot != null)
             {
@@ -1302,6 +2092,24 @@ namespace FreeCameraAndCollision
                 }
 
                 Press(hits[over], point);
+                if (hits[over].Part == Part.Less || hits[over].Part == Part.More)
+                {
+                    steppedHit = over;
+                    nextStepTime = Time.unscaledTime + StepRepeatDelay;
+                }
+            }
+            else if (steppedHit >= 0)
+            {
+                // An arrow held down keeps stepping while the pointer stays on it.
+                if (!held || over != steppedHit)
+                {
+                    steppedHit = -1;
+                }
+                else if (Time.unscaledTime >= nextStepTime)
+                {
+                    nextStepTime = Time.unscaledTime + StepRepeatInterval;
+                    Press(hits[over], point);
+                }
             }
         }
 
@@ -1312,9 +2120,18 @@ namespace FreeCameraAndCollision
                 case Part.HideBody:
                     return playerBody != null;
                 case Part.Slider:
+                case Part.Less:
+                case Part.More:
                     return RowEnabled(sliderRows[hit.Index].Id);
                 case Part.Reset:
                     return SettingOf(sliderRows[hit.Index].Id).Set;
+                case Part.StormPrevious:
+                case Part.StormNext:
+                    return stormNames.Length > 1;
+                case Part.Summon:
+                    return stormNames.Length > 0;
+                case Part.Lightning:
+                    return stormSummoned && lightning != null;
                 default:
                     return true;
             }
@@ -1353,6 +2170,35 @@ namespace FreeCameraAndCollision
                     break;
                 case Part.Reset:
                     ResetSlider(sliderRows[hit.Index].Id);
+                    break;
+                case Part.Less:
+                    StepSlider(sliderRows[hit.Index].Id, -1);
+                    break;
+                case Part.More:
+                    StepSlider(sliderRows[hit.Index].Id, 1);
+                    break;
+                case Part.StormPrevious:
+                    stormIndex = (stormIndex + stormNames.Length - 1) % stormNames.Length;
+                    ChangeSummonedStorm();
+                    break;
+                case Part.StormNext:
+                    stormIndex = (stormIndex + 1) % stormNames.Length;
+                    ChangeSummonedStorm();
+                    break;
+                case Part.Summon:
+                    // The lit switch pressed again puts the storm back.
+                    if (stormSummoned)
+                    {
+                        PutStormBack();
+                    }
+                    else
+                    {
+                        SummonStorm();
+                    }
+
+                    break;
+                case Part.Lightning:
+                    Strike();
                     break;
             }
         }
@@ -1413,6 +2259,8 @@ namespace FreeCameraAndCollision
                     row.Label.color = Faded(ink, enabledRow);
                     row.Value.color = Faded(ink, enabledRow);
                     row.Bars.color = Faded(barColour, enabledRow);
+                    row.LessPlate.sharedMaterial = row.MorePlate.sharedMaterial = enabledRow ? plateOn : plateOff;
+                    row.LessText.color = row.MoreText.color = Faded(plateInk, enabledRow);
                     if (row.ResetPlate != null)
                     {
                         row.ResetPlate.sharedMaterial = resettable ? plateOn : plateOff;
@@ -1440,6 +2288,21 @@ namespace FreeCameraAndCollision
                 hideBodyLabel.color = Faded(ink, playerBody != null);
                 hideBodyPlate.sharedMaterial = playerBody != null ? plateOn : plateOff;
             }
+
+            int storm = stormNames.Length == 0 ? -2 : stormIndex * 2 + (stormSummoned ? 1 : 0);
+            if (storm != shownStorm)
+            {
+                shownStorm = storm;
+                bool any = stormNames.Length > 0;
+                bool choose = stormNames.Length > 1;
+                stormNameText.text = any ? "storm: " + stormNames[stormIndex] : "no storm";
+                stormNameText.color = Faded(ink, any);
+                stormPreviousPlate.sharedMaterial = stormNextPlate.sharedMaterial = choose ? plateOn : plateOff;
+                summonPlate.sharedMaterial = stormSummoned ? plateOn : plateOff;
+                bool strikes = stormSummoned && lightning != null;
+                lightningPlate.sharedMaterial = strikes ? plateOn : plateOff;
+                lightningText.color = Faded(plateInk, strikes);
+            }
         }
 
         private static Color Faded(Color colour, bool full)
@@ -1449,11 +2312,39 @@ namespace FreeCameraAndCollision
 
         private bool RowEnabled(SliderId id)
         {
-            return depthOfField || (id != SliderId.FocusDistance && id != SliderId.Aperture);
+            switch (id)
+            {
+                case SliderId.FocusDistance:
+                case SliderId.Aperture:
+                    return depthOfField;
+                case SliderId.StormDistance:
+                case SliderId.StormDirection:
+                case SliderId.FlashLight:
+                case SliderId.FlashSky:
+                    return stormSummoned;
+                default:
+                    return true;
+            }
         }
 
-        // The settings by slider, by reference; focus distance and aperture are plain values and use time's slot only as a
-        // placeholder (their rows have no reset).
+        // Plain values with no game value to follow have no reset.
+        private static bool HasReset(SliderId id)
+        {
+            switch (id)
+            {
+                case SliderId.FocusDistance:
+                case SliderId.Aperture:
+                case SliderId.StormDistance:
+                case SliderId.StormDirection:
+                case SliderId.FlashSky:
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        // The settings by slider, by reference; the plain values (focus distance, aperture, the storm's place, the flash sky
+        // brightness) use time's slot only as a placeholder (their rows have no reset).
         private ref Setting SettingOf(SliderId id)
         {
             switch (id)
@@ -1473,6 +2364,7 @@ namespace FreeCameraAndCollision
                 case SliderId.ChromaticAberration: return ref chromaticAberration;
                 case SliderId.Fog: return ref fogDensity;
                 case SliderId.VolumetricFog: return ref volumetricFog;
+                case SliderId.FlashLight: return ref flashLight;
                 default: return ref time;
             }
         }
@@ -1487,6 +2379,21 @@ namespace FreeCameraAndCollision
             if (id == SliderId.Aperture)
             {
                 return aperture;
+            }
+
+            if (id == SliderId.StormDistance)
+            {
+                return stormDistance;
+            }
+
+            if (id == SliderId.StormDirection)
+            {
+                return stormDirection;
+            }
+
+            if (id == SliderId.FlashSky)
+            {
+                return flashSky;
             }
 
             Setting setting = SettingOf(id);
@@ -1507,6 +2414,8 @@ namespace FreeCameraAndCollision
                 case SliderId.Fog:
                 case SliderId.VolumetricFog:
                     return 1f;
+                case SliderId.FlashLight:
+                    return strikeLight != null ? strikeLight.intensity : 0f;
             }
 
             if (originalProfile == null)
@@ -1550,7 +2459,49 @@ namespace FreeCameraAndCollision
                 case SliderId.BloomThreshold: maximum = 2f; return;
                 case SliderId.VignetteSoftness: minimum = 0.01f; maximum = 1f; return;
                 case SliderId.GrainSize: minimum = 0.3f; maximum = 3f; return;
+                case SliderId.StormDistance: maximum = MaximumStormDistance; return;
+                case SliderId.StormDirection: minimum = -180f; maximum = 180f; return;
+                case SliderId.FlashLight: maximum = MaximumFlashLight; return;
+                case SliderId.FlashSky: minimum = 1f; maximum = MaximumFlashSky; return;
                 default: maximum = 1f; return;
+            }
+        }
+
+        // One arrow press: the value shown, one step on, on the step's grid and within the range. Focus distance steps by a
+        // hundredth of its logarithmic scale.
+        private void StepSlider(SliderId id, int direction)
+        {
+            float value;
+            if (id == SliderId.FocusDistance)
+            {
+                value = FromFraction(id, (Mathf.Round(Fraction(id, ShownValue(id)) * 100f) + direction) / 100f);
+            }
+            else
+            {
+                Range(id, out float minimum, out float maximum);
+                float step = StepSize(id);
+                value = Mathf.Clamp((Mathf.Round(ShownValue(id) / step) + direction) * step, minimum, maximum);
+            }
+
+            SetSlider(id, value);
+        }
+
+        // One step of each slider: the smallest change its shown value shows (5 minutes for the time of day).
+        private static float StepSize(SliderId id)
+        {
+            switch (id)
+            {
+                case SliderId.Time: return 5f / 60f;
+                case SliderId.FieldOfView:
+                case SliderId.Temperature:
+                case SliderId.Tint:
+                case SliderId.StormDirection: return 1f;
+                case SliderId.FlashLight: return 0.5f;
+                case SliderId.Aperture:
+                case SliderId.Exposure:
+                case SliderId.StormDistance:
+                case SliderId.FlashSky: return 0.1f;
+                default: return 0.01f;
             }
         }
 
@@ -1583,6 +2534,37 @@ namespace FreeCameraAndCollision
             if (id == SliderId.Aperture)
             {
                 aperture = value;
+                return;
+            }
+
+            if (id == SliderId.StormDistance || id == SliderId.StormDirection)
+            {
+                if (value == (id == SliderId.StormDistance ? stormDistance : stormDirection))
+                {
+                    return;
+                }
+
+                if (id == SliderId.StormDistance)
+                {
+                    stormDistance = value;
+                }
+                else
+                {
+                    stormDirection = value;
+                }
+
+                if (summoned != null)
+                {
+                    MoveStorm();
+                }
+
+                return;
+            }
+
+            // The flash values are applied each LateUpdate while a strike is shown.
+            if (id == SliderId.FlashSky)
+            {
+                flashSky = value;
                 return;
             }
 
@@ -1637,13 +2619,23 @@ namespace FreeCameraAndCollision
                 case SliderId.Tint: return value.ToString("0");
                 case SliderId.Fog:
                 case SliderId.VolumetricFog: return "x" + value.ToString("0.00");
+                case SliderId.StormDistance: return value.ToString("0.0") + " km";
+                case SliderId.StormDirection: return value.ToString("+0;-0;0") + "°";
+                case SliderId.FlashLight: return value.ToString("0.0");
+                case SliderId.FlashSky: return "x" + value.ToString("0.0");
                 default: return value.ToString("0.00");
             }
         }
 
+        // To the nearest minute, so a time on the 5-minute step grid shows as that minute.
         private static string FormatTime(float hours)
         {
-            int minutes = Mathf.FloorToInt(Mathf.Repeat(hours, 24f) * 60f);
+            int minutes = Mathf.RoundToInt(hours * 60f) % (24 * 60);
+            if (minutes < 0)
+            {
+                minutes += 24 * 60;
+            }
+
             return (minutes / 60).ToString("00") + ":" + (minutes % 60).ToString("00");
         }
 
